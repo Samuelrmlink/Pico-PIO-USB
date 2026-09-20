@@ -262,6 +262,65 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
           pio_usb_bus_send_handshake(pp, USB_PID_ACK);
           return idx - 4;
         }
+        // km003c_rp2_webapp: adapted from sekigon-gonnoc/Pico-PIO-USB PR #211
+        // (same root cause as upstream issue #97, open since 2023). The RX
+        // PIO can lock onto a packet a few bits early, so every byte is
+        // shifted and the aligned CRC check above fails on data that is
+        // actually valid — confirmed on our own hardware via an independent
+        // Cynthion capture showing clean, correctly-decoded packets on the
+        // wire at the exact moments this driver reported a receive failure
+        // (root cause of hub-mediated disconnect detection never completing).
+        //
+        // Deliberately does NOT send our own ACK here, unlike upstream
+        // PR #211: sending a handshake this late is well outside the USB
+        // spec's strict 2-7 bit-time turnaround window (see the timing
+        // comment below on the normal-path ACK), and attempting it from a
+        // stale/unexpected PIO TX state hung this firmware completely
+        // (confirmed by reverting just the ACK call and retesting). Skipping
+        // our ACK just means the sender re-sends on its own retry/next poll
+        // — harmless here, since we already see this endpoint re-polled
+        // relentlessly regardless. We still recover and use the data for
+        // our own decode, which is the actual thing that was broken.
+        //
+        // Since a correct packet always begins with SYNC (0x80), the amount
+        // of shift is not a guess: drop k leading bits until SYNC reappears,
+        // then confirm with the PID check nibble and a recomputed CRC.
+        if (idx >= 4 && idx <= 18) {
+          for (uint8_t k = 1; k <= 7; k++) {
+            uint8_t fixed[19];
+            for (int16_t i = 0; i < idx; i++) {
+              uint8_t hi = (i + 1 < idx) ? (uint8_t)(pp->usb_rx_buffer[i + 1] << (8 - k)) : 0;
+              fixed[i] = (uint8_t)((pp->usb_rx_buffer[i] >> k) | hi);
+            }
+            if (fixed[0] != USB_SYNC) {
+              continue;
+            }
+            uint8_t rpid = fixed[1];
+            if ((uint8_t)((rpid >> 4) ^ (rpid & 0x0f)) != 0x0f) {
+              continue;
+            }
+            // Try the realigned packet at its natural length and one byte
+            // shorter (the shift can drop the final partial byte).
+            for (int16_t n = idx; n >= idx - 1; n--) {
+              if (n < 4) {
+                continue;
+              }
+              uint16_t c = 0xffff;
+              for (int16_t i = 2; i < n - 2; i++) {
+                c = update_usb_crc16(c, fixed[i]);
+              }
+              c ^= 0xffff;
+              uint16_t rx_crc =
+                  (uint16_t)fixed[n - 2] | ((uint16_t)fixed[n - 1] << 8);
+              if (c == rx_crc) {
+                for (int16_t i = 0; i < n; i++) {
+                  pp->usb_rx_buffer[i] = fixed[i];
+                }
+                return n - 4;
+              }
+            }
+          }
+        }
       } else {
         // always send other handshake NAK/STALL
         pio_usb_bus_send_handshake(pp, handshake);
