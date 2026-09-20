@@ -534,10 +534,36 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
 // Transaction helper
 //--------------------------------------------------------------------+
 
+// km003c_rp2_webapp diagnostics: outcome histogram for IN transactions on
+// NON-hub, non-control endpoints (i.e. the meter's bulk/interrupt data path),
+// to distinguish "device never answered" from "device answered but we
+// dropped it" (DATA0/1 toggle mismatch is silently retried below).
+volatile uint32_t km003c_dbg_in_data_ok = 0;
+volatile uint32_t km003c_dbg_in_toggle_mismatch = 0;
+volatile uint32_t km003c_dbg_in_nak = 0;
+volatile uint32_t km003c_dbg_in_stall = 0;
+volatile uint32_t km003c_dbg_in_noresp = 0;
+volatile uint32_t km003c_dbg_in_last_mismatch_pid = 0;   // received PID (low byte) on the last mismatch
+volatile uint32_t km003c_dbg_in_last_mismatch_expect = 0;
+
+void km003c_pio_in_counters(uint32_t *ok, uint32_t *mismatch, uint32_t *nak, uint32_t *stall,
+                            uint32_t *noresp, uint32_t *last_pid, uint32_t *last_expect) {
+  if (ok) *ok = km003c_dbg_in_data_ok;
+  if (mismatch) *mismatch = km003c_dbg_in_toggle_mismatch;
+  if (nak) *nak = km003c_dbg_in_nak;
+  if (stall) *stall = km003c_dbg_in_stall;
+  if (noresp) *noresp = km003c_dbg_in_noresp;
+  if (last_pid) *last_pid = km003c_dbg_in_last_mismatch_pid;
+  if (last_expect) *last_expect = km003c_dbg_in_last_mismatch_expect;
+}
+
 static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
                                                              endpoint_t *ep) {
   int res = 0;
   uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
+  // Only count the device data path: address 1 (CFG_TUH_DEVICE_MAX=1 puts
+  // the hub at 2) and non-control endpoints.
+  bool const count = (ep->dev_addr == 1) && ((ep->ep_num & 0x0f) != 0);
 
   pio_usb_bus_prepare_receive(pp);
   pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num);
@@ -548,17 +574,26 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
 
   if (receive_len >= 0) {
     if (receive_pid == expect_pid) {
+      if (count) km003c_dbg_in_data_ok++;
       memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
       pio_usb_ll_transfer_continue(ep, receive_len);
     } else {
       // DATA0/1 mismatched, 0 for re-try next frame
+      if (count) {
+        km003c_dbg_in_toggle_mismatch++;
+        km003c_dbg_in_last_mismatch_pid = receive_pid;
+        km003c_dbg_in_last_mismatch_expect = expect_pid;
+      }
     }
   } else if (receive_pid == USB_PID_NAK) {
     // NAK try again next frame
+    if (count) km003c_dbg_in_nak++;
   } else if (receive_pid == USB_PID_STALL) {
+    if (count) km003c_dbg_in_stall++;
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_STALLED_BITS);
   } else {
     res = -1;
+    if (count) km003c_dbg_in_noresp++;
     if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
       res = -2;
     }
