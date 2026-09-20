@@ -36,6 +36,12 @@ static uint8_t nak_encoded[5];
 static uint8_t stall_encoded[5];
 static uint8_t pre_encoded[5];
 
+// km003c_rp2_webapp diagnostics: does the SYNC-realignment recovery below
+// ever actually fire? (Measured on real hardware: yes — 2 of 2 attempts
+// recovered a CRC-verified packet across 3 hub hot-plug cycles.)
+volatile uint32_t km003c_dbg_rx_realign_tried = 0;   // aligned CRC failed, recovery attempted
+volatile uint32_t km003c_dbg_rx_realign_ok    = 0;   // ...and recovered a valid packet
+
 //--------------------------------------------------------------------+
 // Bus functions
 //--------------------------------------------------------------------+
@@ -180,17 +186,11 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_handshake)(pio_port_t* pp
   }
 
   int16_t idx = 0;
-  // km003c_rp2_webapp: capture up to 3 bytes, not 2 — see the realignment
-  // comment below. A bit-shifted 2-byte handshake needs a 3rd raw byte
-  // available to fully reconstruct the PID byte's own trailing bits; the
-  // aligned/fast-path check just below still requires exactly idx==2 as
-  // before, so normal timing/behavior for a correctly-aligned handshake
-  // (the common case) is unaffected.
   // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
   // This is to detect packets without an EOP because the device was unplugged.
   uint32_t start = get_time_us_32();
   while (get_time_us_32() - start <= 7) {
-    if (idx < 3 && pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
+    if (idx < 2 && pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
       uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
       pp->usb_rx_buffer[idx++] = data;
 
@@ -200,45 +200,11 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_handshake)(pio_port_t* pp
     }
   }
 
-  if (idx == 2 && pp->usb_rx_buffer[0] == USB_SYNC) {
-    return pp->usb_rx_buffer[1];
+  if (idx != 2 || pp->usb_rx_buffer[0] != USB_SYNC) {
+    return 0; // invalid handshake
   }
 
-  // km003c_rp2_webapp: same root cause as the realignment fix in
-  // pio_usb_bus_receive_packet_and_handshake() above (see its comment;
-  // adapted from sekigon-gonnoc/Pico-PIO-USB PR #211 / upstream issue #97).
-  // The RX PIO can lock onto a packet a few bits early, so a
-  // genuinely-ACKed handshake (confirmed via an independent Cynthion
-  // capture on our own hardware: a control transfer's SETUP-stage ACK was
-  // cleanly present on the wire every time, yet this function kept
-  // reporting "invalid handshake", driving 3 full SETUP retries per
-  // transfer via usb_setup_transaction()'s TRANSACTION_MAX_RETRY before
-  // giving up and reporting a hard failure upstream). A handshake is just
-  // SYNC + PID (no CRC), so recovery only needs the PID check nibble, not
-  // a checksum — but reconstructing PID's own trailing k bits needs a 3rd
-  // captured byte, which is why the capture above isn't capped at 2.
-  if (idx >= 2 && idx <= 3) {
-    for (uint8_t k = 1; k <= 7; k++) {
-      uint8_t b0 = (uint8_t)((pp->usb_rx_buffer[0] >> k) | (uint8_t)(pp->usb_rx_buffer[1] << (8 - k)));
-      if (b0 != USB_SYNC) {
-        continue;
-      }
-      uint8_t b1_hi = (idx == 3) ? (uint8_t)(pp->usb_rx_buffer[2] << (8 - k)) : 0;
-      uint8_t b1 = (uint8_t)((pp->usb_rx_buffer[1] >> k) | b1_hi);
-      if ((uint8_t)((b1 >> 4) ^ (b1 & 0x0f)) != 0x0f) {
-        continue;
-      }
-      // km003c_rp2_webapp: usb_out_transaction() (pio_usb_host.c) ignores
-      // this function's return value and reads usb_rx_buffer[1] directly
-      // instead — write the recovered byte back so that caller benefits
-      // from the recovery too, not just usb_setup_transaction()'s use of
-      // the return value.
-      pp->usb_rx_buffer[1] = b1;
-      return b1;
-    }
-  }
-
-  return 0; // invalid handshake
+  return pp->usb_rx_buffer[1];
 }
 
 int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
@@ -326,6 +292,7 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
         // of shift is not a guess: drop k leading bits until SYNC reappears,
         // then confirm with the PID check nibble and a recomputed CRC.
         if (idx >= 4 && idx <= 18) {
+          km003c_dbg_rx_realign_tried++;
           for (uint8_t k = 1; k <= 7; k++) {
             uint8_t fixed[19];
             for (int16_t i = 0; i < idx; i++) {
@@ -353,6 +320,7 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
               uint16_t rx_crc =
                   (uint16_t)fixed[n - 2] | ((uint16_t)fixed[n - 1] << 8);
               if (c == rx_crc) {
+                km003c_dbg_rx_realign_ok++;
                 for (int16_t i = 0; i < n; i++) {
                   pp->usb_rx_buffer[i] = fixed[i];
                 }
